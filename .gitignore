@@ -1,0 +1,14 @@
+# kernel build
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+.module-common.o
+modules.order
+Module.symvers
+.tmp_versions/
+# tui build
+*.d
+tui/pmtop
