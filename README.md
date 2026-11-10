@@ -1,4 +1,11 @@
-# procmon — Process Monitoring Kernel Module + `pmtop` TUI
+# procmon — Process Monitoring Kernel Module
+
+> **Start here: [`stages/`](stages/README.md).** Three small modules (hello →
+> process list → fork/exit events) with a step-by-step guide, screenshots list
+> and evidence checks. That is the assignment version.
+>
+> Everything below is the **full / bonus version**: a bigger module
+> (`procmon.ko`) plus `pmtop`, a k9s-style terminal UI.
 
 A Linux kernel module (`procmon.ko`) that collects process information
 straight from the kernel's `task_struct`s and exposes it through
@@ -44,6 +51,7 @@ k9s-style interface: an info header, key hints, a colored table,
 
 ```
 kernel_module_OS/
+├── stages/                   ★ assignment version: 3 small modules + guide
 ├── Makefile                  top level: make / make load / make run
 ├── include/
 │   └── procmon_shared.h      THE CONTRACT: paths, field order, format version
@@ -65,19 +73,25 @@ kernel_module_OS/
 │       ├── theme.[ch]        k9s-like color palette (256 / 8 colors)
 │       ├── ui.[ch]           layout: header, prompt, footer, dialogs
 │       ├── table.[ch]        reusable table widget
-│       ├── input.[ch]        key dispatch, : and / modes
+│       ├── input.[ch]        key dispatch, : and / modes, kill dialog
+│       ├── actions.[ch]      race-free kill (pidfd + start-time check)
+│       ├── users.[ch]        uid → user name cache
+│       ├── format.[ch]       human-readable sizes, times, durations
+│       └── ../tests/         unit tests for parsers + metrics (make test)
 │       └── views/
 │           ├── view.h        `struct view` interface
 │           ├── registry.c    list of views + global key hints
 │           ├── processes.c   main process table
 │           ├── tree.c        parent/child tree
-│           ├── detail.c      one process in depth
+│           ├── detail.c      describe: fields, gauges, CPU history, children
 │           ├── events.c      live fork/exec/exit stream
 │           └── help.c        key bindings
 └── scripts/
     ├── load.sh               insmod (reloads if already loaded)
     ├── unload.sh             rmmod
-    └── smoke_test.sh         checks /proc/procmon format
+    ├── events_test.py        checks fork/exec/exit events with a known workload
+    ├── smoke_test.sh         checks /proc/procmon format
+    └── xcheck_proc.py        compares every field with /proc/<pid>/stat (+ statm for RSS)
 ```
 
 ## Kernel ↔ user interface
@@ -114,30 +128,57 @@ Design decisions:
 ## pmtop UI
 
 ```
- Host:    studentVM          <enter>   Describe   <shift-t> Sort Thr    ┌─┐┌┬┐┌┬┐┌─┐┌─┐
- Kernel:  7.0.0-30-generic   <ctrl-k>  Kill       <shift-s> Sort State  ├─┘│││ │ │ │├─┘
- procmon: v0.1.0             <shift-c> Sort CPU   <:>       Command     ┴  ┴ ┴ ┴ └─┘┴
- Uptime:  0d 03:12:44        <shift-m> Sort MEM   </>       Filter
- Load:    0.52 0.40 0.31     <shift-p> Sort PID   <?>       Help        process monitor
- MEM:     [█████░░░░░░░░░]  38%  <shift-n> Sort Name  <esc>     Back
- Procs:   312  R2 S305 Z0
-┌──────────────────────────── processes(all)[312] ─────────────────────────────┐
-│    PID    PPID  USER   S   PRI  NI  THR  CPU%↓  MEM%    VSZ     RSS  NAME    │
-│   1423    1200  1000   R    20   0   34   12.5   4.1   3.2G  310.4M  firefox │  ← cursor bar
-│    812       1  0      S    20   0    1    0.3   0.2  22.1M    9.8M  sshd    │
-└──────────────────────────────────────────────────────────────────────────────┘
-  <processes>                                                    flash messages
+ Host:    studentVM                <enter>   Describe   <shift-s> Sort State   ┌─┐┌┬┐┌┬┐┌─┐┌─┐
+ Kernel:  7.0.0-30-generic         <ctrl-k>  Kill       <:>       Command      ├─┘│││ │ │ │├─┘
+ procmon: v0.1.0                   <shift-c> Sort CPU   </>       Filter       ┴  ┴ ┴ ┴ └─┘┴
+ Uptime:  0d 00:37:24              <shift-m> Sort MEM   <?>       Help
+ Load:    1.04 0.76 0.60  (2 cpu)  <shift-p> Sort PID   <esc>     Back         process monitor
+ CPU:     [███████░░░░░░░]  52%    <shift-n> Sort Name  <ctrl-l>  Redraw
+ MEM:     [██████░░░░░░░░]  42% 3.2/7.7G   <shift-t> Sort Thr   <ctrl-c>  Quit
+ Procs:   341  R3 S338 T0 Z0
+┌──────────────────────────────── processes(all)[341] ────────────────────────────────┐
+│    PID  NAME              PPID  USER   S  PRI  NI  THR  CPU%↓  MEM%     VSZ     RSS │
+│  28522  yes              28509  1000   R   20   0    1   95.3   0.0    8.1M    1.9M │  ← cursor bar
+│   1317  java                 1  1002   S   20   0  110    1.0   5.4    4.6G  427.2M │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+  <processes>                                                         flash messages
 ```
+
+How the numbers are made:
+
+- **CPU%** per process = Δ(utime+stime) between two refreshes ÷ Δwall time.
+  Percent of *one* CPU, like `top` (a process with two busy threads shows 200%).
+  A process is matched across samples by pid **and** start time, so a recycled
+  pid starts fresh. A process born between samples is measured over its own lifetime.
+- **Header CPU** = all processes' CPU time ÷ (Δwall × number of CPUs).
+- **MEM%** = RSS ÷ total RAM. Header MEM = (total − available) ÷ total, like `free`.
+- The cursor follows the selected **pid** across refreshes, while sorting or filtering
+  jumps back to the top.
 
 | Key | Action |
 |---|---|
 | `↑ ↓` / `j k`, `PgUp PgDn`, `g G` | move |
 | `:` | command: `proc`, `tree`, `events`, `help`, `q` |
-| `/` | live filter by name or pid (`esc` clears) |
+| `/` | live filter by name, pid or user (`esc` clears) |
 | `enter` / `d` | describe the selected process |
-| `ctrl-k` | kill (with confirmation) |
+| `ctrl-k` | kill dialog: `←/→` (or `h/l`, `tab`) picks TERM/KILL/INT/HUP/STOP/CONT, `y`/`enter` sends, `n`/`esc` cancels |
 | `shift-c/m/p/n/t/s` | sort by CPU / MEM / PID / Name / Threads / State (again = reverse) |
 | `?` | help · `esc` back · `ctrl-l` redraw · `ctrl-c` / `q` quit |
+
+In **events** (`:events`): newest first. `space` pauses, `c` clears, `f` / `x` / `z`
+show or hide fork / exec / exit, `/` filters, `enter` describes the process. The
+footer shows events per second and whether any were lost ("kernel dropped" =
+overwritten in the module's ring buffer, "pmtop missed" = gaps in `seq`).
+
+In **describe**: `j/k` moves through the children, `enter` describes a child,
+`p` jumps to the parent, `ctrl-k` kills, `esc` goes back. If the process exits
+while you look at it, the view keeps its last values and marks it *exited*.
+
+**Kill is race-free.** pmtop never does `kill(pid)`. It opens a pidfd (a handle
+to that one process), checks the process still has the start time you saw
+(otherwise the pid was reused by something else), and signals through the pidfd.
+Without root you can only signal your own processes; pmtop explains `EPERM` instead
+of failing silently.
 
 Row colors: **green** running, **yellow** D/T (blocked or stopped),
 **red** zombie, **gray** kernel threads and idle, **aqua** everything else.
@@ -152,9 +193,17 @@ make            # builds kmod/procmon.ko and tui/pmtop
 make load       # sudo insmod (use ./scripts/load.sh max_events=4096 for params)
 cat /proc/procmon/summary
 ./scripts/smoke_test.sh
-make run        # start pmtop
+make run        # start pmtop   (pmtop -d 500 for a 500 ms refresh)
+make test       # unit + kill tests; + procfs/xcheck tests when the module is loaded
 make unload
 ```
+
+Known limitations:
+
+- Kernel threads show their 15-char name (`pool_workqueue_`), as `ps` does.
+  `/proc` shows longer names using kernel-internal data that modules can't reach.
+- RSS is the exact value (like `ps` and `/proc/<pid>/statm`). `/proc/<pid>/stat`
+  shows a slightly lower *approximate* value, so don't compare against that.
 
 > If `insmod` fails with *Key was rejected by service*, Secure Boot is
 > enforcing module signatures. Either disable Secure Boot in the VM or
@@ -165,10 +214,11 @@ make unload
 | Step | Scope | Status |
 |---|---|---|
 | 1 | Structure, build system, shared ABI, procfs plumbing, TUI chrome | **done** |
-| 2 | `pm_collect.c`: real process data + summary | todo |
-| 3 | `source.c` parsers, `metrics.c` CPU%/MEM% → live process table | todo |
-| 4 | detail view, kill dialog, uid → username, header CPU gauge | todo |
-| 5 | `pm_events.c` tracepoints + ring buffer, events view | todo |
-| 6 | tree view, polish, smoke tests, stress test with many processes | todo |
+| 2 | `pm_collect.c`: real process data + summary | **done** |
+| 3 | `source.c` parsers, `metrics.c` CPU%/MEM% → live process table | **done** |
+| 4 | detail view, kill dialog, uid → username, header CPU gauge | **done** |
+| 5 | `pm_events.c` tracepoints + ring buffer, events view | **done** |
+| 6 | tree view (`:tree` is still a placeholder), more polish | optional, not started |
 
-Look for `TODO(step N)` in the code to see exactly what each step fills in.
+Every step is verified: `make test` runs the unit and kill tests, plus the
+procfs, event and `/proc` cross-checks when the module is loaded.

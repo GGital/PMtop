@@ -8,9 +8,12 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/utsname.h>
 #include <time.h>
 
+#include "actions.h"
+#include "format.h"
 #include "model.h"
 #include "theme.h"
 #include "ui.h"
@@ -135,14 +138,16 @@ static void info_line(int y, const char *label, const char *value)
 	attroff(COLOR_PAIR(CP_INFO_VALUE));
 }
 
-/* "[█████░░░░░]  43%" */
-static void gauge(int y, int x, int w, double pct)
+/* "[█████░░░░░]  43%" - fill is capped at 100, the number is not */
+void ui_gauge(int y, int x, int w, double pct)
 {
 	int fill = (int)(pct / 100.0 * w + 0.5);
 	int pair = pct < 60 ? CP_GAUGE_LOW : pct < 85 ? CP_GAUGE_MID : CP_GAUGE_HIGH;
 
 	if (fill > w)
 		fill = w;
+	if (fill < 0)
+		fill = 0;
 	mvaddch(y, x, '[');
 	attron(COLOR_PAIR(pair));
 	for (int i = 0; i < w; i++)
@@ -151,19 +156,41 @@ static void gauge(int y, int x, int w, double pct)
 	printw("] %3.0f%%", pct);
 }
 
-static void fmt_uptime(char *buf, size_t len, uint64_t ns)
+/* The last w values as ▁▂▃▄▅▆▇█, scaled to `max`. Newest on the right. */
+void ui_sparkline(int y, int x, int w, const double *v, int n, double max)
 {
-	uint64_t s = ns / 1000000000ULL;
+	static const char *const bars[] = { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+	int first = n > w ? n - w : 0;
 
-	snprintf(buf, len, "%llud %02llu:%02llu:%02llu",
-		 (unsigned long long)(s / 86400), (unsigned long long)(s / 3600 % 24),
-		 (unsigned long long)(s / 60 % 60), (unsigned long long)(s % 60));
+	move(y, x);
+	for (int i = 0; i < w - (n - first); i++)   /* pad left until history fills */
+		addch(' ');
+	for (int i = first; i < n; i++) {
+		int lvl = max > 0 ? (int)(v[i] / max * 8 + 0.5) : 0;
+		int pair = v[i] < 60 ? CP_GAUGE_LOW : v[i] < 85 ? CP_GAUGE_MID : CP_GAUGE_HIGH;
+
+		if (lvl > 8)
+			lvl = 8;
+		if (lvl == 0 && v[i] > 0.05)
+			lvl = 1;                 /* any activity at all is visible */
+		attron(COLOR_PAIR(pair));
+		addstr(bars[lvl]);
+		attroff(COLOR_PAIR(pair));
+	}
+}
+
+/* 7.71 GiB style, input in KiB */
+static void fmt_gib(char *buf, size_t len, unsigned long kb)
+{
+	snprintf(buf, len, "%.1f", kb / (1024.0 * 1024.0));
 }
 
 static void draw_info(const struct app *app)
 {
 	const struct sys_summary *s = &app->data.sum;
-	char buf[64];
+	char buf[64], used[16], total[16];
+	unsigned long used_kb = s->mem_total_kb > s->mem_avail_kb
+				? s->mem_total_kb - s->mem_avail_kb : 0;
 
 	info_line(0, "Host:", uts.nodename);
 	info_line(1, "Kernel:", uts.release);
@@ -174,17 +201,25 @@ static void draw_info(const struct app *app)
 	info_line(2, "procmon:", buf);
 	fmt_uptime(buf, sizeof(buf), s->uptime_ns);
 	info_line(3, "Uptime:", buf);
-	snprintf(buf, sizeof(buf), "%.2f %.2f %.2f",
-		 s->load_x100[0] / 100.0, s->load_x100[1] / 100.0, s->load_x100[2] / 100.0);
+	snprintf(buf, sizeof(buf), "%.2f %.2f %.2f  (%u cpu)",
+		 s->load_x100[0] / 100.0, s->load_x100[1] / 100.0,
+		 s->load_x100[2] / 100.0, s->nr_cpus);
 	info_line(4, "Load:", buf);
 
-	info_line(5, "MEM:", "");
-	gauge(5, 10, 14, s->mem_total_kb
-		  ? 100.0 * (s->mem_total_kb - s->mem_avail_kb) / s->mem_total_kb : 0);
+	info_line(5, "CPU:", "");
+	ui_gauge(5, 10, 14, app->data.cpu_total_pct);
 
-	snprintf(buf, sizeof(buf), "%u  R%u S%u Z%u", s->procs_total,
-		 s->procs_running, s->procs_sleeping, s->procs_zombie);
-	info_line(6, "Procs:", buf);
+	info_line(6, "MEM:", "");
+	ui_gauge(6, 10, 14, s->mem_total_kb ? 100.0 * used_kb / s->mem_total_kb : 0);
+	fmt_gib(used, sizeof(used), used_kb);
+	fmt_gib(total, sizeof(total), s->mem_total_kb);
+	attron(COLOR_PAIR(CP_KEY_DESC));
+	printw(" %s/%sG", used, total);
+	attroff(COLOR_PAIR(CP_KEY_DESC));
+
+	snprintf(buf, sizeof(buf), "%u  R%u S%u T%u Z%u", s->procs_total,
+		 s->procs_running, s->procs_sleeping, s->procs_stopped, s->procs_zombie);
+	info_line(7, "Procs:", buf);
 }
 
 static void draw_hints(const struct app *app)
@@ -267,8 +302,12 @@ static void draw_footer(const struct app *app)
 	move(y, 0);
 	clrtoeol();
 	move(y, 1);
-	if (app->prev_view != app->view)
-		crumb(view_get(app->prev_view)->name, CP_CRUMB);
+	/* a path from the root view: <processes> [<previous>] <current> */
+	if (app->view != VIEW_PROCESSES) {
+		crumb(view_get(VIEW_PROCESSES)->name, CP_CRUMB);
+		if (app->prev_view != VIEW_PROCESSES && app->prev_view != app->view)
+			crumb(view_get(app->prev_view)->name, CP_CRUMB);
+	}
 	crumb(view_get(app->view)->name, CP_CRUMB_ACTIVE);
 
 	if (app->flash[0] && ui_now() < app->flash_until) {
@@ -287,18 +326,43 @@ static void draw_footer(const struct app *app)
 	}
 }
 
+/*
+ *  ┌──────────── kill ────────────┐
+ *  │  Send signal to 1234 (sleep)  │
+ *  │  TERM  KILL  INT  HUP  ...    │   ← / → picks, selected is highlighted
+ *  │  ask it to exit (can be caught)
+ *  │  <y> Send   <n/esc> Cancel    │
+ *  └───────────────────────────────┘
+ */
 static void draw_confirm(const struct app *app)
 {
-	struct rect r = { LINES / 2 - 3, COLS / 2 - 26, 7, 52 };
-	const struct proc_row *p = model_selected(app);
-	char msg[96];
+	struct rect r = { LINES / 2 - 4, COLS / 2 - 28, 9, 56 };
+	const struct signal_choice *c = &signal_choices[app->kill_choice];
+	char msg[128];
+	int x;
 
+	if (r.x < 0)
+		r.x = 0;
 	ui_fill(r, CP_DEFAULT);
 	ui_frame(r, "kill", NULL);
-	snprintf(msg, sizeof(msg), "Send SIGTERM to %d (%s)?", app->target_pid,
-		 p ? p->comm : "?");
-	ui_center_text(r, -1, CP_INFO_VALUE, msg);
-	ui_center_text(r, 1, CP_KEY, "<y> OK      <n/esc> Cancel");
+	snprintf(msg, sizeof(msg), "Send signal to %d (%s)?", app->kill_pid, app->kill_name);
+	ui_center_text((struct rect){ r.y + 1, r.x, 2, r.w }, 0, CP_INFO_VALUE, msg);
+
+	/* signal picker */
+	x = r.x + 3;
+	for (size_t i = 0; i < nsignal_choices; i++) {
+		int pair = i == app->kill_choice ? CP_ROW_SELECTED : CP_KEY;
+
+		attron(COLOR_PAIR(pair) | A_BOLD);
+		mvprintw(r.y + 4, x, " %s ", signal_choices[i].name);
+		attroff(COLOR_PAIR(pair) | A_BOLD);
+		x += (int)strlen(signal_choices[i].name) + 3;
+	}
+	snprintf(msg, sizeof(msg), "SIG%s: %s", c->name, c->desc);
+	ui_center_text((struct rect){ r.y + 5, r.x, 2, r.w }, 0,
+		       c->sig == SIGKILL || c->sig == SIGSTOP ? CP_ROW_WARN : CP_KEY_DESC, msg);
+	ui_center_text((struct rect){ r.y + 7, r.x, 1, r.w }, 0, CP_KEY,
+		       "<←/→> signal   <y/enter> Send   <n/esc> Cancel");
 }
 
 /* ------------------------------------------------------------------ */

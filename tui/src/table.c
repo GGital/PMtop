@@ -1,4 +1,5 @@
 #include <ncurses.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "table.h"
@@ -6,6 +7,8 @@
 
 #define COL_GAP 2
 #define MAX_COLS 24
+#define FLEX_MIN 15
+#define FLEX_MAX 32   /* very wide terminal: leave the rest empty */
 
 static void layout(const struct table_spec *s, int total_w, int *widths)
 {
@@ -19,22 +22,50 @@ static void layout(const struct table_spec *s, int total_w, int *widths)
 	}
 	if (flex >= 0) {
 		widths[flex] = total_w - used;
-		if (widths[flex] < 4)
-			widths[flex] = 4;
+		if (widths[flex] < FLEX_MIN)   /* narrow terminal: clip at right */
+			widths[flex] = FLEX_MIN;
+		if (widths[flex] > FLEX_MAX)
+			widths[flex] = FLEX_MAX;
 	}
 }
 
-/* Print `text` into a cell of width w, padded/truncated, aligned. */
+/*
+ * Byte length of the longest prefix of UTF-8 `s` that fits in `cols`
+ * screen columns; *used gets the columns it takes. Every code point is
+ * treated as 1 column wide (true for box/arrow glyphs and most names).
+ */
+static int utf8_fit(const char *s, int cols, int *used)
+{
+	int bytes = 0, n = 0;
+
+	while (s[bytes] && n < cols) {
+		bytes++;
+		while ((s[bytes] & 0xC0) == 0x80)   /* skip continuation bytes */
+			bytes++;
+		n++;
+	}
+	*used = n;
+	return bytes;
+}
+
+/* Print `text` into a cell of w COLUMNS (not bytes), padded/truncated. */
 static void put_cell(int y, int x, int w, enum table_align a, const char *text)
 {
-	int len = (int)strlen(text);
+	int cols, bytes = utf8_fit(text, w, &cols);
+	int pad = w - cols;
 
-	if (len > w)
-		len = w;
 	if (a == ALIGN_RIGHT)
-		mvprintw(y, x, "%*.*s", w, len, text);
+		mvprintw(y, x, "%*s%.*s", pad, "", bytes, text);
 	else
-		mvprintw(y, x, "%-*.*s", w, len, text);
+		mvprintw(y, x, "%.*s%*s", bytes, text, pad, "");
+}
+
+/* Columns that do not fit are clipped (narrow terminal), never wrapped. */
+static int clip(int x, int w, struct rect area)
+{
+	int right = area.x + area.w - 1;
+
+	return x + w > right ? right - x : w;
 }
 
 void table_draw(struct rect area, const struct table_spec *s,
@@ -52,12 +83,15 @@ void table_draw(struct rect area, const struct table_spec *s,
 	attron(COLOR_PAIR(CP_TABLE_HEADER) | A_BOLD);
 	for (int c = 0, x = area.x + 1; c < s->ncols; c++) {
 		const char *t = s->cols[c].title;
+		int w = clip(x, widths[c], area);
 
+		if (w <= 0)
+			break;
 		if (c == s->sort_col) {
 			snprintf(buf, sizeof(buf), "%s%s", t, s->sort_desc ? "↓" : "↑");
 			t = buf;
 		}
-		put_cell(area.y, x, widths[c], s->cols[c].align, t);
+		put_cell(area.y, x, w, s->cols[c].align, t);
 		x += widths[c] + COL_GAP;
 	}
 	attroff(COLOR_PAIR(CP_TABLE_HEADER) | A_BOLD);
@@ -93,9 +127,13 @@ void table_draw(struct rect area, const struct table_spec *s,
 		attron(COLOR_PAIR(pair));
 		mvhline(y, area.x, ' ', area.w);
 		for (int c = 0, x = area.x + 1; c < s->ncols; c++) {
+			int w = clip(x, widths[c], area);
+
+			if (w <= 0)
+				break;
 			buf[0] = '\0';
 			s->cell(s->ctx, row, c, buf, sizeof(buf));
-			put_cell(y, x, widths[c], s->cols[c].align, buf);
+			put_cell(y, x, w, s->cols[c].align, buf);
 			x += widths[c] + COL_GAP;
 		}
 		attroff(COLOR_PAIR(pair));

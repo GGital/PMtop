@@ -4,6 +4,7 @@
 #include <strings.h>
 
 #include "model.h"
+#include "users.h"
 
 static const struct app *sort_ctx;   /* qsort has no user pointer */
 
@@ -34,18 +35,34 @@ static bool matches(const struct proc_row *p, const char *filter)
 		return true;
 	if (strcasestr(p->comm, filter))
 		return true;
+	if (strcasestr(user_name(p->uid), filter))
+		return true;
 	snprintf(pidbuf, sizeof(pidbuf), "%d", p->pid);
 	return strstr(pidbuf, filter) != NULL;
 }
 
-void model_rebuild(struct app *app)
+pid_t model_selected_pid(const struct app *app)
 {
-	pid_t keep = -1;
 	const struct proc_row *sel = model_selected(app);
 
-	if (sel)
-		keep = sel->pid;
+	return sel ? sel->pid : -1;
+}
 
+/* Sort or filter changed: start again from the top, like k9s. */
+void model_rebuild(struct app *app)
+{
+	app->cursor[VIEW_PROCESSES] = 0;
+	app->scrolls[VIEW_PROCESSES] = 0;
+	model_rebuild_keep(app, -1);
+}
+
+/*
+ * `keep` must be captured while visible[] still indexes app->data.
+ * After a refresh swaps data/prev, visible[] points into the OLD
+ * buffer, so refresh_data() grabs the pid before the swap.
+ */
+void model_rebuild_keep(struct app *app, pid_t keep)
+{
 	free(app->visible);
 	app->visible = calloc(app->data.nprocs ? app->data.nprocs : 1,
 			      sizeof(*app->visible));
@@ -60,11 +77,11 @@ void model_rebuild(struct app *app)
 	sort_ctx = app;
 	qsort(app->visible, app->nvisible, sizeof(*app->visible), cmp_rows);
 
-	/* keep the cursor on the same process if it still exists */
-	app->selected = 0;
+	/* keep the cursor on the same process if it still exists,
+	 * otherwise stay at the same row index (table_draw clamps it) */
 	for (size_t i = 0; keep >= 0 && i < app->nvisible; i++) {
 		if (app->data.procs[app->visible[i]].pid == keep) {
-			app->selected = (int)i;
+			app->cursor[VIEW_PROCESSES] = (int)i;
 			break;
 		}
 	}
@@ -72,10 +89,28 @@ void model_rebuild(struct app *app)
 
 const struct proc_row *model_selected(const struct app *app)
 {
-	if (!app->visible || app->selected < 0 ||
-	    (size_t)app->selected >= app->nvisible)
+	if (!app->visible || app->cursor[VIEW_PROCESSES] < 0 ||
+	    (size_t)app->cursor[VIEW_PROCESSES] >= app->nvisible)
 		return NULL;
-	return &app->data.procs[app->visible[app->selected]];
+	return &app->data.procs[app->visible[app->cursor[VIEW_PROCESSES]]];
+}
+
+const struct proc_row *model_find(const struct app *app, pid_t pid, uint64_t start_ns)
+{
+	size_t lo = 0, hi = app->data.nprocs;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		const struct proc_row *p = &app->data.procs[mid];
+
+		if (p->pid == pid)
+			return (!start_ns || p->start_ns == start_ns) ? p : NULL;
+		if (p->pid < pid)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return NULL;
 }
 
 const char *model_sort_name(sort_key_t k)

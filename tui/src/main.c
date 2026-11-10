@@ -5,7 +5,8 @@
  *
  * Main loop:
  *   every refresh_ms : swap(prev, data); source_refresh(data);
- *                      metrics_compute(data, prev); model_rebuild()
+ *                      source_read_events(events);
+ *                      metrics_compute(data, prev); model_rebuild_keep()
  *   every iteration  : ui_draw(); getch() with 100 ms timeout; input_handle()
  */
 #include <getopt.h>
@@ -21,6 +22,7 @@
 #include "model.h"
 #include "source.h"
 #include "ui.h"
+#include "views/view.h"
 
 static void usage(const char *argv0)
 {
@@ -32,15 +34,29 @@ static void usage(const char *argv0)
 
 static void refresh_data(struct app *app)
 {
-	/* Reuse buffers: the old `prev` becomes the new `data`. */
+	pid_t keep = model_selected_pid(app);   /* before visible[] goes stale */
 	struct dataset tmp = app->prev;
+	bool was_loaded = app->data.module_loaded;
 
+	/* Reuse buffers: the old `prev` becomes the new `data`. */
 	app->prev = app->data;
 	app->data = tmp;
-	/* TODO(step 3): event history should live outside the swap. */
+
 	source_refresh(&app->data);
+	if (app->data.module_loaded) {
+		/* module reloaded -> its seq counter restarted */
+		if (app->data.sum.events_seq < app->events.last_seq)
+			app->events.last_seq = 0;
+		source_read_events(&app->events);
+		if (!was_loaded && app->prev.taken_at > 0)
+			app_flash(app, false, "procmon module detected");
+	} else if (was_loaded) {
+		app_flash(app, true, "procmon module went away");
+	}
+
 	metrics_compute(&app->data, &app->prev);
-	model_rebuild(app);
+	model_rebuild_keep(app, keep);
+	detail_on_refresh(app);
 }
 
 int main(int argc, char **argv)
@@ -77,7 +93,8 @@ int main(int argc, char **argv)
 		double now = ui_now();
 		int ch;
 
-		if (now >= next_refresh) {
+		if (now >= next_refresh || app.force_refresh) {
+			app.force_refresh = false;
 			refresh_data(&app);
 			next_refresh = now + app.refresh_ms / 1000.0;
 		}
@@ -92,6 +109,7 @@ int main(int argc, char **argv)
 	ui_shutdown();
 	source_free(&app.data);
 	source_free(&app.prev);
+	event_log_free(&app.events);
 	free(app.visible);
 	return 0;
 }

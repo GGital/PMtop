@@ -7,8 +7,6 @@
  *
  * A process is matched across samples by (pid, start_ns) so a recycled
  * pid is never mistaken for the old process.
- *
- * STATUS: skeleton. Implemented in step 3.
  */
 #ifndef PMTOP_METRICS_H
 #define PMTOP_METRICS_H

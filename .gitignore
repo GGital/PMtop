@@ -12,3 +12,5 @@ Module.symvers
 # tui build
 *.d
 tui/pmtop
+tui/tests/test_source
+tui/tests/test_actions

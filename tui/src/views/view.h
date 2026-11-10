@@ -7,7 +7,7 @@
  *   ----------  -------------------  ---------------------------------
  *   processes   :proc :ps :p          table of all processes (default)
  *   tree        :tree :t              parent/child hierarchy
- *   detail      (enter / d)           one process: all fields + gauges
+ *   describe    (enter / d)           one process: fields, gauges, history, children
  *   events      :events :ev :e        live fork/exec/exit stream
  *   help        ?  :help              all key bindings
  */
@@ -44,6 +44,11 @@ extern const struct view view_help;
 const struct view *view_get(view_id_t id);
 int                view_lookup(const char *command);   /* -1 if unknown */
 void               view_switch(struct app *app, view_id_t id);
+
+/* detail.c: describe `p` (switches to the detail view) */
+void detail_open(struct app *app, const struct proc_row *p);
+/* detail.c: called after every data refresh (tracks target, CPU history) */
+void detail_on_refresh(struct app *app);
 
 /* global hints, shown on every view */
 extern const struct key_hint global_hints[];

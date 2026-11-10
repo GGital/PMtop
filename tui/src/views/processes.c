@@ -1,40 +1,43 @@
 /*
  * processes.c - The main view: a sortable, filterable process table.
  *
- * STATUS: table rendering + sorting keys work. USER column shows the
- *         numeric uid for now (name lookup cache: step 4).
+ * Filter (/) matches name, pid or user name.
  */
 #include <ncurses.h>
 #include <stdio.h>
 
 #include "view.h"
+#include "../format.h"
+#include "../input.h"
 #include "../model.h"
 #include "../table.h"
 #include "../theme.h"
+#include "../users.h"
 
+/* k9s-style: identity first (PID, NAME), then state, then resources. */
 enum {
-	COL_PID, COL_PPID, COL_USER, COL_STATE, COL_PRI, COL_NI, COL_THR,
-	COL_CPU, COL_MEM, COL_VSZ, COL_RSS, COL_TIME, COL_NAME, NCOLS
+	COL_PID, COL_NAME, COL_PPID, COL_USER, COL_STATE, COL_PRI, COL_NI,
+	COL_THR, COL_CPU, COL_MEM, COL_VSZ, COL_RSS, COL_TIME, NCOLS
 };
 
 static const struct table_col cols[NCOLS] = {
 	[COL_PID]   = { "PID",   7, ALIGN_RIGHT },
+	[COL_NAME]  = { "NAME",  0, ALIGN_LEFT  },  /* flex: >= 15, grows */
 	[COL_PPID]  = { "PPID",  7, ALIGN_RIGHT },
-	[COL_USER]  = { "USER",  9, ALIGN_LEFT  },
+	[COL_USER]  = { "USER",  8, ALIGN_LEFT  },
 	[COL_STATE] = { "S",     2, ALIGN_LEFT  },
-	[COL_PRI]   = { "PRI",   4, ALIGN_RIGHT },
+	[COL_PRI]   = { "PRI",   3, ALIGN_RIGHT },
 	[COL_NI]    = { "NI",    3, ALIGN_RIGHT },
 	[COL_THR]   = { "THR",   4, ALIGN_RIGHT },
-	[COL_CPU]   = { "CPU%",  6, ALIGN_RIGHT },
-	[COL_MEM]   = { "MEM%",  6, ALIGN_RIGHT },
-	[COL_VSZ]   = { "VSZ",   8, ALIGN_RIGHT },
-	[COL_RSS]   = { "RSS",   8, ALIGN_RIGHT },
+	[COL_CPU]   = { "CPU%",  5, ALIGN_RIGHT },
+	[COL_MEM]   = { "MEM%",  5, ALIGN_RIGHT },
+	[COL_VSZ]   = { "VSZ",   7, ALIGN_RIGHT },
+	[COL_RSS]   = { "RSS",   7, ALIGN_RIGHT },
 	[COL_TIME]  = { "TIME",  9, ALIGN_RIGHT },
-	[COL_NAME]  = { "NAME",  0, ALIGN_LEFT  },
 };
 
 static const struct key_hint hints[] = {
-	{ "enter",   "Describe"   },
+	{ "enter/d", "Describe"   },
 	{ "ctrl-k",  "Kill"       },
 	{ "shift-c", "Sort CPU"   },
 	{ "shift-m", "Sort MEM"   },
@@ -46,30 +49,6 @@ static const struct key_hint hints[] = {
 
 static const char *const aliases[] = { "proc", "processes", "ps", "p", NULL };
 
-/* "123456" KiB -> "120.6M" */
-static void fmt_kb(char *buf, size_t len, unsigned long kb)
-{
-	if (kb >= 1024UL * 1024)
-		snprintf(buf, len, "%.1fG", kb / (1024.0 * 1024));
-	else if (kb >= 1024)
-		snprintf(buf, len, "%.1fM", kb / 1024.0);
-	else
-		snprintf(buf, len, "%luK", kb);
-}
-
-/* cumulative cpu ns -> "mm:ss.cc" or "hh:mm:ss" */
-static void fmt_cputime(char *buf, size_t len, uint64_t ns)
-{
-	uint64_t cs = ns / 10000000ULL, s = cs / 100;
-
-	if (s >= 3600)
-		snprintf(buf, len, "%llu:%02llu:%02llu", (unsigned long long)(s / 3600),
-			 (unsigned long long)(s / 60 % 60), (unsigned long long)(s % 60));
-	else
-		snprintf(buf, len, "%llu:%02llu.%02llu", (unsigned long long)(s / 60),
-			 (unsigned long long)(s % 60), (unsigned long long)(cs % 100));
-}
-
 static void cell(void *ctx, size_t row, int col, char *buf, size_t len)
 {
 	struct app *app = ctx;
@@ -78,7 +57,7 @@ static void cell(void *ctx, size_t row, int col, char *buf, size_t len)
 	switch (col) {
 	case COL_PID:   snprintf(buf, len, "%d", p->pid); break;
 	case COL_PPID:  snprintf(buf, len, "%d", p->ppid); break;
-	case COL_USER:  snprintf(buf, len, "%u", p->uid); break; /* TODO(step 4): name */
+	case COL_USER:  snprintf(buf, len, "%s", user_name(p->uid)); break;
 	case COL_STATE: snprintf(buf, len, "%c", p->state); break;
 	case COL_PRI:   snprintf(buf, len, "%d", p->prio); break;
 	case COL_NI:    snprintf(buf, len, "%d", p->nice); break;
@@ -143,14 +122,20 @@ static size_t draw(struct app *app, struct rect body)
 		ui_center_text(body, 1, CP_KEY_DESC, "sudo insmod kmod/procmon.ko   (or: make load)");
 		return 0;
 	}
-	if (app->data.nprocs == 0) {
-		ui_center_text(body, 0, CP_KEY_DESC,
-			       "module loaded, but no data yet (collector is a stub until step 2)");
+	if (app->data.error[0]) {
+		ui_center_text(body, -1, CP_FLASH_ERR, "could not read procmon data");
+		ui_center_text(body, 1, CP_KEY_DESC, app->data.error);
+		return 0;
+	}
+	if (app->nvisible == 0) {
+		ui_center_text(body, 0, CP_KEY_DESC, app->filter[0]
+			       ? "no process matches the filter  (esc clears)"
+			       : "no processes");
 		return 0;
 	}
 
 	table_draw((struct rect){ body.y + 1, body.x + 1, body.h - 2, body.w - 2 },
-		   &spec, &app->selected, &app->scroll);
+		   &spec, &app->cursor[VIEW_PROCESSES], &app->scrolls[VIEW_PROCESSES]);
 	return app->nvisible;
 }
 
@@ -179,17 +164,12 @@ static bool on_key(struct app *app, int ch)
 	case '\n':
 	case KEY_ENTER:
 	case 'd':
-		if (!sel)
-			return true;
-		app->target_pid = sel->pid;
-		view_switch(app, VIEW_DETAIL);
+		if (sel)
+			detail_open(app, sel);
 		return true;
 	case 11: /* ctrl-k */
-		if (!sel)
-			return true;
-		app->target_pid = sel->pid;
-		app->kill_signal = 15; /* SIGTERM */
-		app->mode = MODE_CONFIRM;
+		if (sel)
+			input_open_kill(app, sel);
 		return true;
 	}
 	return false;

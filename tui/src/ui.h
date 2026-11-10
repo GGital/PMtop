@@ -1,7 +1,7 @@
 /*
  * ui.h - Screen layout and shared drawing primitives.
  *
- *  ┌──────────────────────────── HEADER (7 rows) ────────────────────────────┐
+ *  ┌──────────────────────────── HEADER (8 rows) ────────────────────────────┐
  *  │ Host/Kernel/Uptime/CPU/MEM info │ <key> hints (view + global) │  LOGO   │
  *  ├──────────────────────────── PROMPT (3 rows, only in : or / mode) ───────┤
  *  ├──────────────────────────── BODY (rest) ────────────────────────────────┤
@@ -28,7 +28,7 @@ struct key_hint {
 	const char *desc;   /* "Kill", "Sort CPU" ...           */
 };
 
-#define HEADER_H 7
+#define HEADER_H 8
 #define PROMPT_H 3
 #define FOOTER_H 1
 
@@ -42,6 +42,8 @@ size_t ui_draw(struct app *app, int *page);
 void   ui_frame(struct rect r, const char *title, const char *accent);
 void   ui_center_text(struct rect r, int dy, int pair, const char *text);
 void   ui_fill(struct rect r, int pair);
+void   ui_gauge(int y, int x, int w, double pct);
+void   ui_sparkline(int y, int x, int w, const double *v, int n, double max);
 
 /* helpers */
 double ui_now(void);

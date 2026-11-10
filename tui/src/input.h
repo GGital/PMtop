@@ -13,4 +13,7 @@
 
 void input_handle(struct app *app, int ch, size_t list_len, int page);
 
+/* Open the kill dialog for `p` (MODE_CONFIRM). Pre-selects SIGTERM. */
+void input_open_kill(struct app *app, const struct proc_row *p);
+
 #endif

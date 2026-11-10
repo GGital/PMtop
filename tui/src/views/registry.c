@@ -41,7 +41,8 @@ void view_switch(struct app *app, view_id_t id)
 {
 	if (id == app->view)
 		return;
+	/* cursor/scroll are per view (app->cursor[]), so going back to a
+	 * view returns you to the row you left */
 	app->prev_view = app->view;
 	app->view = id;
-	app->scroll = 0;
 }
