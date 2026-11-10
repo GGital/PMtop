@@ -9,7 +9,7 @@ assignment step by step:
 | Choose what to do with it | [Part 0](#what-i-chose-to-build) (a process monitor) |
 | **Create** the module | [Stage 2](#stage-2--pmon-v10-create-a-process-list) |
 | **Modify / improve** it | [Stage 3](#stage-3--pmon-v20-improve-watch-fork-and-exit) |
-| **Compile** and **use** it | the *Compile* / *Load* / *Use* steps of every stage |
+| **Compile** and **use** it | the *Compile* / *Load* / *Use* steps of every stage, and [Stage 4](#stage-4--pmview-use-the-module-from-a-program) (a program that uses it) |
 | **Evidence** the modifications were applied | the ✔ checks and [Evidence summary](#evidence-summary) |
 
 ```
@@ -17,7 +17,8 @@ stages/
 ├── 1_hello/      hello.c   44 lines   init/exit, dmesg, parameter
 ├── 2_proclist/   pmon.c   108 lines   v1.0: /proc/pmon  (process list)
 ├── 3_events/     pmon.c   293 lines   v2.0: + /proc/pmon_events (fork/exit)
-└── demo.sh                runs every step below and checks the result
+├── 4_tui/        pmview.c 582 lines   user-space k9s-style viewer for v2.0
+└── demo.sh                runs stages 1-3 and checks the result
 ```
 
 Run everything (and take screenshots) with:
@@ -318,6 +319,75 @@ test commands + `tail /proc/pmon_events`, `rmmod` + `dmesg`.
 
 ---
 
+## Stage 4 · pmview: use the module from a program
+
+Folder: [4_tui/](4_tui/pmview.c). This one is **not** a kernel module. It's a
+normal program, and it shows how user space consumes what a module provides.
+It reads the module's files once per second and draws them like the
+Kubernetes tool *k9s*:
+
+```
+ Host:    studentVM                                 <tab> Switch view                   ┌─┐┌┬┐┬  ┬
+ Kernel:  7.0.0-30-generic                          </>   Filter                        ├─┘│││└┐┌┘
+ Module:  pmon v2.0                                 <j/k> Move                          ┴  ┴ ┴ └┘
+ Procs:   347  (running 1, zombie 0)                <P>   Sort PID
+ Events:  601 forks, 603 exits since load
+
+┌───────────────────────────────────────── processes[347] ─────────────────────────────────────────┐
+│     PID    PPID  S     THR  RSS(KB)↓ MEM         NAME                                            │
+│   10791    7720  S      14    483508 ██████████  MainThread                                      │
+│    1317       1  S     110    446916 █████████·  java                                            │
+│   55124       1  S      37    400048 ████████··  mysqld                                          │
+│    4737    3771  S       9    378340 ████████··  2.1.321-c6c6b56                                 │
+│    2453    1822  S      23    373948 ████████··  gnome-shell                                     │
+│    3974    1822  S       6    210612 ████······  update-manager                                  │
+│    7873    7751  S      11    165808 ███·······  MainThread                                      │
+│ ...                                                                                              │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ <processes>    data from /proc/pmon, refreshed every second
+```
+
+| It reads | From the module | Shown as |
+|---|---|---|
+| `/proc/pmon` | the process list (stage 2/3) | **processes** view: sortable table, colored by state, memory bars |
+| `/proc/pmon_events` | the fork/exit ring buffer (stage 3) | **events** view: newest first, FORK green, killed red, error exit yellow |
+| `/sys/module/pmon/version` | `MODULE_VERSION("2.0")` | header: `Module: pmon v2.0` |
+
+The code is one file in four parts: **1. data** (read and `sscanf` the
+`/proc` files), **2. view state** (filter and sort), **3. drawing** (ncurses),
+**4. keyboard + main loop**. It needs no special permission, because the module
+made its files readable by everyone (`0444`).
+
+```bash
+cd stages/4_tui
+make                                   # needs libncurses-dev
+# with stages/3_events/pmon.ko loaded:
+./pmview
+```
+
+Keys: `tab` (or `1` / `2`) switches view, `j/k` or arrows move, `/` filters by
+name or PID (in the events view also by event or result, e.g. `/killed` or
+`/exit code 3`), `P N R T` sort by PID / name / memory / threads, `ctrl-l` redraws,
+`q` quits.
+
+Good things to show:
+
+- In another terminal run `sh -c 'exit 3'` and `sleep 100 & sleep 0.3; kill -9 $!`,
+  then type `/killed` or `/exit code 3` in the **events** view. The ring buffer
+  holds only the last 64 events and a desktop creates many processes in the
+  background, so filter instead of scrolling. Wait a moment before `kill`:
+  killed *before* it calls `exec()`, the child is still a copy of `bash` and is
+  logged under that name.
+- Unload the module (`sudo rmmod pmon`) while pmview is running: it shows
+  "pmon is not loaded". Load **v1.0** (stage 2) instead: the processes view
+  works, the events view says it needs v2.0. That's direct evidence of what the
+  modification added.
+
+📸 **Screenshots:** processes view, events view after the test commands, the
+"needs pmon v2.0" message with v1.0 loaded.
+
+---
+
 ## Evidence summary
 
 Everything below is checked automatically by `./stages/demo.sh` (✔ = passed):
@@ -331,6 +401,7 @@ Everything below is checked automatically by `./stages/demo.sh` (✔ = passed):
 | The data is real | PPID, threads and RSS of a test process match `ps` exactly |
 | **The modification was applied** | `modinfo` version 1.0 → 2.0; the new `/proc/pmon_events` exists; `dmesg` says `v2.0 … watching fork/exit` |
 | **The improvement works** | `sh` → `exit code 3`, `sleep` → `killed by signal 9`, `ls` → `exit code 0` |
+| User programs can use it | `pmview` shows both files live; with v1.0 loaded its events view is empty ("needs pmon v2.0") |
 
 ## If something goes wrong
 
@@ -341,7 +412,7 @@ Everything below is checked automatically by `./stages/demo.sh` (✔ = passed):
 | `Unknown symbol ...` | missing `MODULE_LICENSE("GPL")` (GPL-only kernel functions) |
 | `module verification failed ... tainting kernel` in dmesg | normal for self-built modules, not an error |
 
-## Bonus: the full version
+## Bonus: the full version (not needed for the stages)
 
 `../kmod/` is a larger version of the same idea (snapshot-based `/proc` files,
 CPU time, exec events), with a k9s-style terminal UI in `../tui/` (`make && make

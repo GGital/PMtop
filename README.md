@@ -1,8 +1,9 @@
 # procmon — Process Monitoring Kernel Module
 
 > **Start here: [`stages/`](stages/README.md).** Three small modules (hello →
-> process list → fork/exit events) with a step-by-step guide, screenshots list
-> and evidence checks. That is the assignment version.
+> process list → fork/exit events), a small k9s-style viewer for them
+> (`stages/4_tui/pmview`), a step-by-step guide, screenshots list and evidence
+> checks. That is the assignment version.
 >
 > Everything below is the **full / bonus version**: a bigger module
 > (`procmon.ko`) plus `pmtop`, a k9s-style terminal UI.

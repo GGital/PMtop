@@ -14,3 +14,4 @@ Module.symvers
 tui/pmtop
 tui/tests/test_source
 tui/tests/test_actions
+stages/4_tui/pmview
