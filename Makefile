@@ -1,38 +1,36 @@
-# procmon - top-level build
+# pmon - process monitor kernel module + pmview terminal viewer
 #
-#   make            build kernel module + TUI
-#   make kmod       build only kmod/procmon.ko
-#   make tui        build only tui/pmtop
-#   make load       insmod the module      (needs sudo)
-#   make unload     rmmod the module       (needs sudo)
-#   make run        start the TUI
-#   make test       TUI unit tests (+ procfs checks if the module is loaded)
+#   make          build module/pmon.ko and viewer/pmview
+#   make load     insmod the module      (asks for sudo)
+#   make unload   rmmod the module       (asks for sudo)
+#   make run      start the viewer
+#   make demo     build, load, test and unload the module (./demo.sh)
 #   make clean
 
-all: kmod tui
+all: module viewer
 
-kmod:
-	$(MAKE) -C kmod
+module:
+	$(MAKE) -C module
 
-tui:
-	$(MAKE) -C tui
+viewer:
+	$(MAKE) -C viewer
 
-load: kmod
-	./scripts/load.sh
+load: module
+	-lsmod | grep -q '^pmon ' && sudo rmmod pmon
+	sudo insmod module/pmon.ko
+	@sudo dmesg | grep 'pmon v' | tail -1
 
 unload:
-	./scripts/unload.sh
+	sudo rmmod pmon
 
-run: tui
-	./tui/pmtop
+run: viewer
+	./viewer/pmview
 
-test:
-	$(MAKE) -C tui test
-	@if [ -d /proc/procmon ]; then ./scripts/smoke_test.sh && ./scripts/events_test.py && ./scripts/xcheck_proc.py; \
-	else echo "(module not loaded: skipping procfs checks)"; fi
+demo:
+	./demo.sh
 
 clean:
-	$(MAKE) -C kmod clean
-	$(MAKE) -C tui clean
+	$(MAKE) -C module clean
+	$(MAKE) -C viewer clean
 
-.PHONY: all kmod tui load unload run test clean
+.PHONY: all module viewer load unload run demo clean

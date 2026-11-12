@@ -9,9 +9,5 @@
 modules.order
 Module.symvers
 .tmp_versions/
-# tui build
-*.d
-tui/pmtop
-tui/tests/test_source
-tui/tests/test_actions
-stages/4_tui/pmview
+# viewer build
+viewer/pmview

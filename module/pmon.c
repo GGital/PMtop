@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * pmon.c v2.0 - Stage 3: the process monitor, improved.
+ * pmon.c v2.0 - the process monitor kernel module.
  *
  * Creates the file /proc/pmon. Reading it (cat /proc/pmon) makes the
  * kernel walk its own list of processes and print one line each:
@@ -65,7 +65,20 @@ static unsigned int ev_count;          /* how many slots are filled         */
 static unsigned long total_forks, total_exits;
 static DEFINE_SPINLOCK(ev_lock);       /* many CPUs fork at the same time   */
 
-/* Store one event; when the buffer is full the oldest is overwritten. */
+/*
+ * add_event() - record one fork/exit event in the ring buffer.
+ * @type: 'F' (fork) or 'X' (exit)
+ * @p:    the task the event is about (its pid and name are copied)
+ * @ppid: parent's process id
+ * @code: raw exit status, only meaningful for 'X'
+ *
+ * Called from the tracepoint probes, so it may run on any CPU, at any
+ * time, inside someone else's fork()/exit(). It must be fast and must
+ * not sleep: that is why ev_lock is a spinlock, not a mutex.
+ * When all 64 slots are used, the oldest event is overwritten.
+ *
+ * Example: ls exits with code 0 -> add_event('X', p, 4100, 0)
+ */
 static void add_event(char type, struct task_struct *p, pid_t ppid, int code)
 {
 	struct pmon_event *e;
@@ -94,6 +107,17 @@ static void add_event(char type, struct task_struct *p, pid_t ppid, int code)
  * fork() and exit() of other processes, so they must be quick and
  * must never sleep.
  */
+/*
+ * pmon_on_fork() - probe attached to the sched_process_fork tracepoint.
+ * @data:   private pointer given at registration (we pass NULL, unused)
+ * @parent: the task that called fork()/clone()
+ * @child:  the newly created task
+ *
+ * The kernel calls this once for every new task, including threads.
+ * thread_group_leader() is true only for a new process, so threads are
+ * skipped. The child still carries the parent's name (comm): it only
+ * becomes "ls" after exec(), so a FORK line shows e.g. "bash".
+ */
 static void pmon_on_fork(void *data, struct task_struct *parent,
 			 struct task_struct *child)
 {
@@ -102,6 +126,19 @@ static void pmon_on_fork(void *data, struct task_struct *parent,
 	add_event('F', child, task_tgid_nr(parent), 0);
 }
 
+/*
+ * pmon_on_exit() - probe attached to the sched_process_exit tracepoint.
+ * @data:       private pointer (unused)
+ * @p:          the task that is exiting
+ * @group_dead: true if this is the LAST thread of its process
+ *
+ * Called for every exiting task. When only a thread ends (group_dead
+ * false) the process lives on, so nothing is logged. The exit code comes
+ * from the shared signal_struct when the whole group is exiting
+ * (exit_group() or a fatal signal), otherwise from the task itself.
+ * The code uses the wait() layout: low 7 bits = signal, bits 8-15 =
+ * exit status (decoded in pmon_events_show()).
+ */
 static void pmon_on_exit(void *data, struct task_struct *p, bool group_dead)
 {
 	struct signal_struct *sig = p->signal;
@@ -123,6 +160,14 @@ static void pmon_on_exit(void *data, struct task_struct *p, bool group_dead)
 /* The tracepoints are not exported, so we look them up by name. */
 static struct tracepoint *tp_fork, *tp_exit;
 
+/*
+ * find_tracepoint() - callback for for_each_kernel_tracepoint().
+ * @tp:   one tracepoint known to the kernel
+ * @priv: unused
+ *
+ * The kernel calls this once per tracepoint it has. We compare the name
+ * and remember the two we want in tp_fork / tp_exit.
+ */
 static void find_tracepoint(struct tracepoint *tp, void *priv)
 {
 	if (!strcmp(tp->name, "sched_process_fork"))
@@ -131,7 +176,19 @@ static void find_tracepoint(struct tracepoint *tp, void *priv)
 		tp_exit = tp;
 }
 
-/* Called every time someone reads /proc/pmon_events. */
+/*
+ * pmon_events_show() - produce the text of /proc/pmon_events.
+ * @m: seq_file buffer; seq_printf() appends to it
+ * @v: unused (single_open() style file)
+ *
+ * Called by the kernel each time someone reads the file. Prints the
+ * header, then the stored events oldest first, then the totals. The
+ * index math walks the ring buffer: the oldest entry is ev_count slots
+ * behind ev_next. ev_lock is held so a fork/exit on another CPU cannot
+ * change the buffer halfway through.
+ *
+ * Example line: [ 3867.614529] EXIT  82653   81469   ls   exit code 0
+ */
 static int pmon_events_show(struct seq_file *m, void *v)
 {
 	unsigned int i, idx;
@@ -166,6 +223,12 @@ static int pmon_events_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/*
+ * pmon_events_open() - .proc_open handler for /proc/pmon_events.
+ * Runs when a program open()s the file. single_open() attaches a
+ * seq_file that will call pmon_events_show() to build the output.
+ * Returns 0 on success or a negative errno (e.g. -ENOMEM).
+ */
 static int pmon_events_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, pmon_events_show, NULL);
@@ -182,7 +245,15 @@ static const struct proc_ops pmon_events_ops = {
 /* /proc/pmon: the process list (same as v1.0)                        */
 /* ------------------------------------------------------------------ */
 
-/* Resident memory of a process in KB (0 for kernel threads). */
+/*
+ * rss_kb() - resident memory (RAM actually used) of a process, in KB.
+ * @p: the process to measure
+ *
+ * Kernel threads have no user memory map (p->mm is NULL) -> returns 0.
+ * task_lock() stops p->mm being released while we read it. The page
+ * count is converted to KB: with 4 KB pages PAGE_SHIFT is 12, so
+ * "<< (12 - 10)" multiplies by 4 (600 pages -> 2400 KB).
+ */
 static unsigned long rss_kb(struct task_struct *p)
 {
 	unsigned long kb = 0;
@@ -194,7 +265,16 @@ static unsigned long rss_kb(struct task_struct *p)
 	return kb;
 }
 
-/* Called every time someone reads /proc/pmon. */
+/*
+ * pmon_show() - produce the text of /proc/pmon (the process list).
+ * @m: seq_file buffer; seq_printf() appends to it
+ * @v: unused
+ *
+ * Called each time someone reads the file. Walks every process under
+ * rcu_read_lock() and prints one row: PID, PPID, state letter, thread
+ * count, RSS in KB, name. Kernel threads are skipped when the
+ * show_kthreads parameter is false.
+ */
 static int pmon_show(struct seq_file *m, void *v)
 {
 	struct task_struct *p;
@@ -222,6 +302,11 @@ static int pmon_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/*
+ * pmon_open() - .proc_open handler for /proc/pmon.
+ * Same role as pmon_events_open(): on open(), attach a seq_file whose
+ * output comes from pmon_show().
+ */
 static int pmon_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, pmon_show, NULL);
@@ -235,6 +320,15 @@ static const struct proc_ops pmon_ops = {
 	.proc_release = single_release,
 };
 
+/*
+ * pmon_init() - module entry point, runs once on insmod.
+ *
+ * Order: (1) find the fork/exit tracepoints, (2) attach our probes,
+ * (3) create the two /proc files. If any step fails, the goto labels at
+ * the bottom undo the earlier steps in reverse order, and the negative
+ * errno is returned so insmod reports the failure and the module is not
+ * loaded. Returns 0 on success.
+ */
 static int __init pmon_init(void)
 {
 	int err;
@@ -269,6 +363,13 @@ undo_fork:
 	return err;
 }
 
+/*
+ * pmon_exit() - module exit point, runs once on rmmod.
+ *
+ * Mirrors pmon_init() in reverse: remove the /proc files, detach the
+ * probes, then wait (tracepoint_synchronize_unregister) until no CPU is
+ * still running a probe. Only then may the module's memory be freed.
+ */
 static void __exit pmon_exit(void)
 {
 	remove_proc_entry(EVENTS_PROC_NAME, NULL);
@@ -289,5 +390,5 @@ module_exit(pmon_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("student");
-MODULE_DESCRIPTION("Stage 3: list processes in /proc/pmon and log fork/exit in /proc/pmon_events");
+MODULE_DESCRIPTION("List processes in /proc/pmon and log fork/exit in /proc/pmon_events");
 MODULE_VERSION("2.0");

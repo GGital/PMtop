@@ -1,225 +1,254 @@
-# procmon — Process Monitoring Kernel Module
+# pmon: a process-monitor kernel module
 
-> **Start here: [`stages/`](stages/README.md).** Three small modules (hello →
-> process list → fork/exit events), a small k9s-style viewer for them
-> (`stages/4_tui/pmview`), a step-by-step guide, screenshots list and evidence
-> checks. That is the assignment version.
->
-> Everything below is the **full / bonus version**: a bigger module
-> (`procmon.ko`) plus `pmtop`, a k9s-style terminal UI.
-
-A Linux kernel module (`procmon.ko`) that collects process information
-straight from the kernel's `task_struct`s and exposes it through
-`/proc/procmon/`. A user-space terminal UI (`pmtop`) draws it in a
-k9s-style interface: an info header, key hints, a colored table,
-`:` commands, `/` filtering and breadcrumbs.
+**pmon** is a Linux kernel module that reads process information straight
+from the kernel's own process list and watches every process being created
+(fork) or exiting. It shows both through two `/proc` files. **pmview** is a
+small k9s-style terminal program that reads those files and draws them live.
 
 ```
-┌──────────────────────────── KERNEL SPACE ─────────────────────────────┐
-│                                                                       │
-│   task list (for_each_process, RCU)      sched tracepoints            │
-│            │                             fork / exec / exit           │
-│            ▼                                     │                    │
-│   ┌──────────────────┐                  ┌────────▼─────────┐          │
-│   │  pm_collect.c    │                  │   pm_events.c    │          │
-│   │  snapshot +      │                  │   ring buffer    │          │
-│   │  summary         │                  │   (spinlock)     │          │
-│   └────────┬─────────┘                  └────────┬─────────┘          │
-│            └──────────────┬──────────────────────┘                    │
-│                  ┌────────▼─────────┐                                 │
-│                  │   pm_procfs.c    │  formats text with seq_file     │
-│                  └────────┬─────────┘                                 │
-│                           │   procmon_main.c: init/exit, params       │
-└───────────────────────────┼───────────────────────────────────────────┘
-          /proc/procmon/{processes, summary, events}   ← include/procmon_shared.h
-┌───────────────────────────┼───────────── USER SPACE ──────────────────┐
-│                  ┌────────▼─────────┐                                 │
-│                  │    source.c      │  parse text → structs           │
-│                  └────────┬─────────┘                                 │
-│                  ┌────────▼─────────┐                                 │
-│                  │    metrics.c     │  CPU% from 2 samples, MEM%      │
-│                  └────────┬─────────┘                                 │
-│                  ┌────────▼─────────┐                                 │
-│                  │    model.c       │  filter + sort → visible[]      │
-│                  └────────┬─────────┘                                 │
-│   input.c ──────► ┌───────▼──────────┐ ◄── theme.c (colors)           │
-│   (keys, modes)   │  ui.c + views/*  │ ◄── table.c (table widget)     │
-│                   └──────────────────┘     ncurses                    │
-└───────────────────────────────────────────────────────────────────────┘
+PMtop/
+├── Makefile        make / make load / make unload / make run / make demo
+├── demo.sh         builds, loads, tests and unloads the module, with ✔ checks
+├── module/
+│   ├── Makefile    Kbuild, out-of-tree
+│   └── pmon.c      the kernel module (v2.0): /proc/pmon + /proc/pmon_events
+└── viewer/
+    ├── Makefile    links -lncursesw
+    └── pmview.c    user-space viewer for the two files
 ```
 
-## Directory layout
-
-```
-kernel_module_OS/
-├── stages/                   ★ assignment version: 3 small modules + guide
-├── Makefile                  top level: make / make load / make run
-├── include/
-│   └── procmon_shared.h      THE CONTRACT: paths, field order, format version
-├── kmod/                     ── kernel module (procmon.ko) ──
-│   ├── Makefile              Kbuild, out-of-tree
-│   ├── pm_internal.h         kernel structs + API between the .c files
-│   ├── procmon_main.c        module_init / module_exit, `max_events` param
-│   ├── pm_collect.c          walks task list → pm_snapshot, pm_summary
-│   ├── pm_procfs.c           /proc/procmon/* via seq_file
-│   └── pm_events.c           tracepoint hooks → ring buffer
-├── tui/                      ── user-space UI (pmtop) ──
-│   ├── Makefile              links -lncursesw
-│   └── src/
-│       ├── main.c            arg parsing, main loop (refresh + draw + input)
-│       ├── app.h             struct app: the whole UI state
-│       ├── source.[ch]       reads + parses /proc/procmon/*
-│       ├── metrics.[ch]      CPU% / MEM% derivation
-│       ├── model.[ch]        filtering, sorting, selection tracking
-│       ├── theme.[ch]        k9s-like color palette (256 / 8 colors)
-│       ├── ui.[ch]           layout: header, prompt, footer, dialogs
-│       ├── table.[ch]        reusable table widget
-│       ├── input.[ch]        key dispatch, : and / modes, kill dialog
-│       ├── actions.[ch]      race-free kill (pidfd + start-time check)
-│       ├── users.[ch]        uid → user name cache
-│       ├── format.[ch]       human-readable sizes, times, durations
-│       └── ../tests/         unit tests for parsers + metrics (make test)
-│       └── views/
-│           ├── view.h        `struct view` interface
-│           ├── registry.c    list of views + global key hints
-│           ├── processes.c   main process table
-│           ├── tree.c        parent/child tree
-│           ├── detail.c      describe: fields, gauges, CPU history, children
-│           ├── events.c      live fork/exec/exit stream
-│           └── help.c        key bindings
-└── scripts/
-    ├── load.sh               insmod (reloads if already loaded)
-    ├── unload.sh             rmmod
-    ├── events_test.py        checks fork/exec/exit events with a known workload
-    ├── smoke_test.sh         checks /proc/procmon format
-    └── xcheck_proc.py        compares every field with /proc/<pid>/stat (+ statm for RSS)
-```
-
-## Kernel ↔ user interface
-
-Everything is plain text, so you can always debug with `cat`.
-The exact format lives in [`include/procmon_shared.h`](include/procmon_shared.h).
-
-| File | Content | How it's produced |
-|---|---|---|
-| `/proc/procmon/processes` | header + one TAB-separated line per process | snapshot taken at `open()`, streamed with `seq_file` |
-| `/proc/procmon/summary` | `key<TAB>value` lines (uptime, load, memory, counts) | `single_open()` |
-| `/proc/procmon/events` | ring buffer of fork/exec/exit, each with a `seq` number | copy of ring under spinlock |
-
-```
-$ head -3 /proc/procmon/processes
-# procmon-processes v1	pid	ppid	uid	state	nice	prio	threads	utime_ns	stime_ns	start_ns	vsz_kb	rss_kb	comm
-1	0	0	S	0	20	1	812000000	2310000000	51000000	23412	14080	systemd
-2	0	0	S	0	20	1	0	4000000	51000000	0	0	kthreadd
-```
-
-Design decisions:
-
-- **Snapshot at open().** The task list is copied under `rcu_read_lock()`
-  into a `kvmalloc`'d array. We never hold the lock across `copy_to_user()`,
-  and the reader sees one consistent moment in time.
-- **No CPU% in the kernel.** The kernel exports cumulative ns; `pmtop`
-  diffs two samples. That keeps the module stateless (no timers).
-- **Events are non-destructive.** Reading `events` doesn't consume
-  anything. The TUI remembers the last `seq` it saw, so several readers
-  can run at once.
-- **`comm` is last and escaped.** Process names can contain spaces, so
-  splitting on TAB always works.
-
-## pmtop UI
-
-```
- Host:    studentVM                <enter>   Describe   <shift-s> Sort State   ┌─┐┌┬┐┌┬┐┌─┐┌─┐
- Kernel:  7.0.0-30-generic         <ctrl-k>  Kill       <:>       Command      ├─┘│││ │ │ │├─┘
- procmon: v0.1.0                   <shift-c> Sort CPU   </>       Filter       ┴  ┴ ┴ ┴ └─┘┴
- Uptime:  0d 00:37:24              <shift-m> Sort MEM   <?>       Help
- Load:    1.04 0.76 0.60  (2 cpu)  <shift-p> Sort PID   <esc>     Back         process monitor
- CPU:     [███████░░░░░░░]  52%    <shift-n> Sort Name  <ctrl-l>  Redraw
- MEM:     [██████░░░░░░░░]  42% 3.2/7.7G   <shift-t> Sort Thr   <ctrl-c>  Quit
- Procs:   341  R3 S338 T0 Z0
-┌──────────────────────────────── processes(all)[341] ────────────────────────────────┐
-│    PID  NAME              PPID  USER   S  PRI  NI  THR  CPU%↓  MEM%     VSZ     RSS │
-│  28522  yes              28509  1000   R   20   0    1   95.3   0.0    8.1M    1.9M │  ← cursor bar
-│   1317  java                 1  1002   S   20   0  110    1.0   5.4    4.6G  427.2M │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-  <processes>                                                         flash messages
-```
-
-How the numbers are made:
-
-- **CPU%** per process = Δ(utime+stime) between two refreshes ÷ Δwall time.
-  Percent of *one* CPU, like `top` (a process with two busy threads shows 200%).
-  A process is matched across samples by pid **and** start time, so a recycled
-  pid starts fresh. A process born between samples is measured over its own lifetime.
-- **Header CPU** = all processes' CPU time ÷ (Δwall × number of CPUs).
-- **MEM%** = RSS ÷ total RAM. Header MEM = (total − available) ÷ total, like `free`.
-- The cursor follows the selected **pid** across refreshes, while sorting or filtering
-  jumps back to the top.
-
-| Key | Action |
-|---|---|
-| `↑ ↓` / `j k`, `PgUp PgDn`, `g G` | move |
-| `:` | command: `proc`, `tree`, `events`, `help`, `q` |
-| `/` | live filter by name, pid or user (`esc` clears) |
-| `enter` / `d` | describe the selected process |
-| `ctrl-k` | kill dialog: `←/→` (or `h/l`, `tab`) picks TERM/KILL/INT/HUP/STOP/CONT, `y`/`enter` sends, `n`/`esc` cancels |
-| `shift-c/m/p/n/t/s` | sort by CPU / MEM / PID / Name / Threads / State (again = reverse) |
-| `?` | help · `esc` back · `ctrl-l` redraw · `ctrl-c` / `q` quit |
-
-In **events** (`:events`): newest first. `space` pauses, `c` clears, `f` / `x` / `z`
-show or hide fork / exec / exit, `/` filters, `enter` describes the process. The
-footer shows events per second and whether any were lost ("kernel dropped" =
-overwritten in the module's ring buffer, "pmtop missed" = gaps in `seq`).
-
-In **describe**: `j/k` moves through the children, `enter` describes a child,
-`p` jumps to the parent, `ctrl-k` kills, `esc` goes back. If the process exits
-while you look at it, the view keeps its last values and marks it *exited*.
-
-**Kill is race-free.** pmtop never does `kill(pid)`. It opens a pidfd (a handle
-to that one process), checks the process still has the start time you saw
-(otherwise the pid was reused by something else), and signals through the pidfd.
-Without root you can only signal your own processes; pmtop explains `EPERM` instead
-of failing silently.
-
-Row colors: **green** running, **yellow** D/T (blocked or stopped),
-**red** zombie, **gray** kernel threads and idle, **aqua** everything else.
-
-## Build & run
-
-Requirements: kernel headers for the running kernel
-(`linux-headers-$(uname -r)`), `gcc`, `make`, `libncurses-dev`.
+Quick start (needs `linux-headers-$(uname -r)` and `libncurses-dev`):
 
 ```bash
-make            # builds kmod/procmon.ko and tui/pmtop
-make load       # sudo insmod (use ./scripts/load.sh max_events=4096 for params)
-cat /proc/procmon/summary
-./scripts/smoke_test.sh
-make run        # start pmtop   (pmtop -d 500 for a 500 ms refresh)
-make test       # unit + kill tests; + procfs/xcheck tests when the module is loaded
-make unload
+make            # build module/pmon.ko and viewer/pmview
+make load       # sudo insmod module/pmon.ko
+make run        # start the viewer
+make unload     # sudo rmmod pmon
+./demo.sh --pause   # step-by-step demo with checks; stops for screenshots
 ```
 
-Known limitations:
+---
 
-- Kernel threads show their 15-char name (`pool_workqueue_`), as `ps` does.
-  `/proc` shows longer names using kernel-internal data that modules can't reach.
-- RSS is the exact value (like `ps` and `/proc/<pid>/statm`). `/proc/<pid>/stat`
-  shows a slightly lower *approximate* value, so don't compare against that.
+## What a kernel module is
 
-> If `insmod` fails with *Key was rejected by service*, Secure Boot is
-> enforcing module signatures. Either disable Secure Boot in the VM or
-> sign the module with a MOK key.
+A **kernel module** is a piece of code that is loaded into the *running* Linux
+kernel without rebooting, and removed again when it's no longer needed.
+Device drivers, file systems and firewalls are usually modules (`lsmod` lists
+the ones loaded right now).
 
-## Roadmap
+| Normal program (user space) | Kernel module (kernel space) |
+|---|---|
+| starts at `main()` and runs until it ends | has an **init** function (on load) and an **exit** function (on unload); in between it waits until the kernel calls it |
+| `printf()` → terminal | `pr_info()` → **kernel log**, read with `dmesg` |
+| a crash kills only that program | a bug can crash the **whole machine** |
+| can only see its own memory | can see **all** kernel data, e.g. every process (`task_struct`) |
+| uses libc | no libc, only kernel functions; must declare `MODULE_LICENSE("GPL")` to use most of them |
 
-| Step | Scope | Status |
-|---|---|---|
-| 1 | Structure, build system, shared ABI, procfs plumbing, TUI chrome | **done** |
-| 2 | `pm_collect.c`: real process data + summary | **done** |
-| 3 | `source.c` parsers, `metrics.c` CPU%/MEM% → live process table | **done** |
-| 4 | detail view, kill dialog, uid → username, header CPU gauge | **done** |
-| 5 | `pm_events.c` tracepoints + ring buffer, events view | **done** |
-| 6 | tree view (`:tree` is still a placeholder), more polish | optional, not started |
+User space talks to a module through files such as **/proc** (this project),
+**/sys** (module parameters) or **/dev** (devices).
 
-Every step is verified: `make test` runs the unit and kill tests, plus the
-procfs, event and `/proc` cross-checks when the module is loaded.
+| Command | What it does |
+|---|---|
+| `make` | builds `pmon.ko` using the kernel's own build system |
+| `modinfo pmon.ko` | shows the module's version, description, parameters |
+| `sudo insmod pmon.ko` | **loads** the module, its init function runs |
+| `lsmod` | lists loaded modules |
+| `sudo dmesg` | shows the kernel log (our `pr_info` messages) |
+| `sudo rmmod pmon` | **unloads** it, its exit function runs |
+
+Tools like `ps` and `top` read process information that the kernel prepares in
+`/proc/<pid>/`. pmon gets the same information *directly* from the kernel's
+process list, and it is notified by the kernel every time a process is
+created or exits, which `ps` can't do: `ps` only sees snapshots.
+
+---
+
+## The module: [module/pmon.c](module/pmon.c)
+
+### 1. The process list: `/proc/pmon`
+
+When the module loads it creates `/proc/pmon`. That's not a real file on disk:
+every time someone reads it, the kernel calls `pmon_show()`, which writes the
+text:
+
+```c
+rcu_read_lock();                     // the list can't change under us
+for_each_process(p) {                // every process in the system
+	if (!show_kthreads && (p->flags & PF_KTHREAD))
+		continue;
+	seq_printf(m, "%-7d %-7d %-5c %-7d %-10lu %s\n",
+		   task_pid_nr(p),                                 // PID
+		   task_pid_nr(rcu_dereference(p->real_parent)),   // PPID
+		   task_state_to_char(p),                          // R/S/D/Z...
+		   get_nr_threads(p),                              // threads
+		   rss_kb(p),                                      // memory
+		   p->comm);                                       // name
+}
+rcu_read_unlock();
+```
+
+- **`struct task_struct`** is the kernel's record of one process.
+  `for_each_process` walks the kernel's list of them.
+- **`rcu_read_lock()`**: processes can exit at any moment on another CPU. RCU
+  guarantees that nothing we're looking at is freed until we unlock.
+- **`task_lock()`** in `rss_kb()`: an exiting process gives up its memory map
+  (`p->mm`). Taking its lock makes sure that can't happen while we read it.
+- **`get_mm_rss_sum()`** adds up the per-CPU memory counters exactly, so the
+  RSS matches what `ps` shows (`get_mm_rss()` is only approximate).
+- **`show_kthreads`** is a parameter with permission `0644`, so root can change
+  it *while the module is running* through `/sys/module/pmon/parameters/`.
+
+```
+PID     PPID    STATE THREADS RSS(KB)    NAME
+1       0       S     1       15004      systemd
+2       0       S     1       0          kthreadd
+...
+total: 341 processes
+```
+
+### 2. Fork and exit events: `/proc/pmon_events`
+
+A process list only shows what's running *at the moment you look*: a program
+that starts and ends between two `cat`s is never seen. So pmon also asks the
+kernel to **call our code every time a process is created or exits**, and keeps
+the last 64 events in `/proc/pmon_events`.
+
+| Part | Why |
+|---|---|
+| `pmon_on_fork()`, `pmon_on_exit()` | our code, called *by the kernel* at every fork / exit |
+| `tracepoint_probe_register()` in init | attaches them to the kernel's `sched_process_fork` / `sched_process_exit` **tracepoints** (hooks built into the kernel for exactly this) |
+| `struct pmon_event events[64]` + `spinlock` | a ring buffer: when full, the oldest event is overwritten. The lock is needed because several CPUs can fork at the same time. |
+| `/proc/pmon_events` | the file that shows the events |
+| unregister + `tracepoint_synchronize_unregister()` in exit | wait until no CPU is still running our code before the module disappears, otherwise the kernel would jump into freed memory |
+
+```c
+static void pmon_on_exit(void *data, struct task_struct *p, bool group_dead)
+{
+	if (!group_dead)
+		return;          // a thread ended, but the process is still alive
+	...
+	add_event('X', p, ppid, code);
+}
+```
+
+### Compile, load, use
+
+```bash
+make
+modinfo -F version module/pmon.ko      # 2.0
+make load
+sudo dmesg | tail -1    # pmon v2.0: created /proc/pmon and /proc/pmon_events, watching fork/exit
+```
+
+Make events we know the answer to, then read what the kernel saw:
+
+```bash
+sh -c 'exit 3'                          # a program that fails with code 3
+sleep 300 & kill -9 $!                  # a program killed by signal 9
+ls / > /dev/null                        # a normal program
+tail -6 /proc/pmon_events
+```
+```
+[ 3867.611836] EXIT  82651   81469   sleep            killed by signal 9
+[ 3867.612390] FORK  82653   81469   bash
+[ 3867.614529] EXIT  82653   81469   ls               exit code 0
+...
+total since load: 15 forks, 16 exits
+```
+
+- A **FORK** line shows the *parent's* name (`bash`), and the **EXIT** of the
+  same PID shows `ls`. A new process starts as a copy of its parent and only
+  becomes `ls` when it calls `exec()`.
+- "16 exits but 15 forks" is correct: some processes that exited were created
+  *before* the module was loaded.
+- Starting threads doesn't create FORK lines (`thread_group_leader` check).
+  pmon counts processes, not threads.
+
+```bash
+make unload
+sudo dmesg | tail -1     # pmon v2.0: removed /proc/pmon and /proc/pmon_events (21 forks, 20 exits seen)
+```
+
+📸 **Screenshots:** `modinfo` (2.0), `make load` + `dmesg`, the three test
+commands + `tail /proc/pmon_events`, `make unload` + `dmesg`.
+
+---
+
+## The viewer: [viewer/pmview.c](viewer/pmview.c)
+
+This one is **not** a kernel module. It's a normal program, and it shows how
+user space consumes what a module provides. It reads the module's files once
+per second and draws them like the Kubernetes tool *k9s*:
+
+```
+ Host:    studentVM                                 <tab> Switch view                   ┌─┐┌┬┐┬  ┬
+ Kernel:  7.0.0-30-generic                          </>   Filter                        ├─┘│││└┐┌┘
+ Module:  pmon v2.0                                 <j/k> Move                          ┴  ┴ ┴ └┘
+ Procs:   347  (running 1, zombie 0)                <P>   Sort PID
+ Events:  601 forks, 603 exits since load
+
+┌───────────────────────────────────────── processes[347] ─────────────────────────────────────────┐
+│     PID    PPID  S     THR  RSS(KB)↓ MEM         NAME                                            │
+│   10791    7720  S      14    483508 ██████████  MainThread                                      │
+│    1317       1  S     110    446916 █████████·  java                                            │
+│ ...                                                                                              │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ <processes>    data from /proc/pmon, refreshed every second
+```
+
+| It reads | Shown as |
+|---|---|
+| `/proc/pmon` | **processes** view: sortable table, colored by state, memory bars |
+| `/proc/pmon_events` | **events** view: newest first, FORK green, killed red, error exit yellow |
+| `/sys/module/pmon/version` | header: `Module: pmon v2.0` |
+
+The code is one file in four parts: **1. data** (read and `sscanf` the `/proc`
+files), **2. view state** (filter and sort), **3. drawing** (ncurses),
+**4. keyboard + main loop**. It needs no special permission, because the module
+made its files readable by everyone (`0444`).
+
+```bash
+make load
+make run
+```
+
+Keys: `tab` (or `1` / `2`) switches view, `j/k` or arrows move, `/` filters by
+name or PID (in the events view also by event or result, e.g. `/killed` or
+`/exit code 3`), `P N R T` sort by PID / name / memory / threads, `ctrl-l`
+redraws, `q` quits.
+
+Good things to show:
+
+- In another terminal run `sh -c 'exit 3'` and `sleep 100 & sleep 0.3; kill -9 $!`,
+  then type `/killed` or `/exit code 3` in the **events** view. The ring buffer
+  holds only the last 64 events and a desktop creates many processes in the
+  background, so filter instead of scrolling. Wait a moment before `kill`:
+  killed *before* it calls `exec()`, the child is still a copy of `bash` and is
+  logged under that name.
+- Unload the module (`make unload`) while pmview is running: it shows
+  "pmon is not loaded".
+
+📸 **Screenshots:** processes view, events view after the test commands.
+
+---
+
+## Evidence summary
+
+Checked automatically by `./demo.sh` (✔ = passed):
+
+| Claim | Evidence |
+|---|---|
+| The module compiles | `pmon.ko` exists; `modinfo` reports version 2.0 |
+| The module creates /proc files | `/proc/pmon` and `/proc/pmon_events` appear on `insmod`, disappear on `rmmod` |
+| init and exit run | `pmon v2.0: created ...` / `removed ...` in `dmesg` |
+| Fork/exit watching works | `sh` → `exit code 3`, `sleep` → `killed by signal 9`, `ls` → `exit code 0` |
+| User programs can use it | `pmview` shows both files live |
+
+## If something goes wrong
+
+| Message | Meaning / fix |
+|---|---|
+| `Key was rejected by service` | Secure Boot only allows signed modules; disable it in the VM settings |
+| `insmod: File exists` | already loaded: `make unload` first |
+| `Unknown symbol ...` | missing `MODULE_LICENSE("GPL")` (GPL-only kernel functions) |
+| `module verification failed ... tainting kernel` in dmesg | normal for self-built modules, not an error |

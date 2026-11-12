@@ -1,4 +1,4 @@
-# pmview: user-space TUI for the pmon v2.0 module (stage 3)
+# pmview: user-space TUI for the pmon v2.0 module
 #   make        build ./pmview
 #   make clean
 pmview: pmview.c

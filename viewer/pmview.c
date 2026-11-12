@@ -1,5 +1,5 @@
 /*
- * pmview.c - Stage 4: a k9s-style terminal UI for the pmon v2.0 module.
+ * pmview.c - a k9s-style terminal UI for the pmon v2.0 module.
  *
  * This is a NORMAL user-space program (not part of the kernel). It shows
  * how user space uses a kernel module: it simply reads the two files the
@@ -9,7 +9,7 @@
  *   /proc/pmon_events   -> "events" view    (fork / exit stream)
  *   /sys/module/pmon/version -> module version shown in the header
  *
- * Build:  make            Run:  ./pmview     (load stages/3_events/pmon.ko first)
+ * Build:  make            Run:  ./pmview     (run make load in the top folder first)
  *
  * Keys:   Tab / 1 / 2   switch view          /       filter (Esc clears; in events
  *                                                    also "killed", "exit code 3")
@@ -272,7 +272,7 @@ static void draw_header(void)
 	if (have_events)
 		COLOR_PRINT(C_VALUE, "%lu forks, %lu exits since load", total_forks, total_exits);
 	else
-		COLOR_PRINT(C_DIM, "needs pmon v2.0 (stage 3)");
+		COLOR_PRINT(C_DIM, "needs pmon v2.0");
 
 	/* middle: key hints in two columns */
 	for (int i = 0; i < 8; i++) {
@@ -410,8 +410,8 @@ static void draw_body(void)
 
 	if (!have_list || (view == VIEW_EVENTS && !have_events)) {
 		const char *msg = !have_list
-			? "pmon is not loaded:  cd stages/3_events && sudo insmod pmon.ko"
-			: "/proc/pmon_events missing: load pmon v2.0 (stage 3), not v1.0";
+			? "pmon is not loaded:  run make load"
+			: "/proc/pmon_events missing: load pmon v2.0";
 		attron(COLOR_PAIR(C_BAD));
 		mvprintw(y + h / 2, (w - (int)strlen(msg)) / 2, "%s", msg);
 		attroff(COLOR_PAIR(C_BAD));
