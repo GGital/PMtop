@@ -215,10 +215,11 @@ enum {
 
 static void init_colors(void)
 {
-	bool c256 = COLORS >= 256;
+	bool c256;
 
-	start_color();
+	start_color();                /* sets COLORS, so check it only after this */
 	use_default_colors();
+	c256 = COLORS >= 256;
 	init_pair(C_LABEL,  c256 ? 208 : COLOR_YELLOW,  -1);   /* orange  */
 	init_pair(C_VALUE,  c256 ? 255 : COLOR_WHITE,   -1);
 	init_pair(C_KEY,    c256 ? 33  : COLOR_BLUE,    -1);   /* blue    */
